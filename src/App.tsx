@@ -21,6 +21,24 @@ import { EditPanel } from "./capture/EditPanel";
 import { VerifierDropzone } from "./verify/VerifierDropzone";
 import { VerificationReport } from "./verify/VerificationReport";
 
+const MIME_TO_EXT: Record<string, string> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/jpg": "jpg",
+  "image/webp": "webp",
+  "image/gif": "gif",
+  "image/svg+xml": "svg",
+};
+
+/** Checks if running inside an iframe / sandboxed frame where showSaveFilePicker throws SecurityError */
+const isSandboxedIframe = (): boolean => {
+  try {
+    return window.self !== window.top;
+  } catch {
+    return true;
+  }
+};
+
 export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<"capture" | "verify">("capture");
 
@@ -59,52 +77,33 @@ export const App: React.FC = () => {
   }, []);
 
   // ─── Professional Download Engine ──────────────────────────────────────────
-  //
-  // ROOT CAUSE (confirmed via anchor interception debug):
-  //   Edge's security zone policy for localhost blocks data: URL navigations,
-  //   strips the `download` attribute, and falls back to a UUID temp name.
-  //
-  // SOLUTION (FileSaver.js battle-tested pattern):
-  //   1. Use blob: URL (not data: URL) — Edge respects the download attribute
-  //      for same-origin blob URLs even in restricted zones.
-  //   2. Revoke the blob URL AFTER 40 s, not synchronously.
-  //      Synchronous revocation drops the filename association before
-  //      the download manager has a chance to read it.
-  //   3. Dispatch the anchor click with setTimeout(fn, 0) — ensures the
-  //      browser has fully registered the href before the download begins.
-  //
-  // ────────────────────────────────────────────────────────────────────────────
-
-  /** Low-level anchor-based file download using FileSaver.js timing pattern */
+  /** Low-level anchor-based file download: clicks immediately and revokes on next tick */
   const downloadWithAnchor = (blob: Blob, filename: string): void => {
     const url = URL.createObjectURL(blob);
 
     const a = document.createElement("a");
     a.href = url;
-    a.download = filename;   // respected for same-origin blob: URLs in Edge & Chrome
+    a.download = filename;
     a.rel = "noopener";
     a.style.display = "none";
     document.body.appendChild(a);
 
-    // 40 s revocation window — FileSaver.js best practice.
-    // Chromium's download manager must fully queue the file before we drop the URL.
+    a.click();
+
+    // Revoke on next tick so the browser starts the download stream cleanly
     setTimeout(() => {
       URL.revokeObjectURL(url);
       if (document.body.contains(a)) {
         document.body.removeChild(a);
       }
-    }, 40_000);
-
-    // Async click — guarantees the browser registers the href before initiating.
-    setTimeout(() => a.click(), 0);
+    }, 0);
   };
 
   /** Primary download: opens native Save-As dialog (guaranteed correct name on all OS).
-   *  Falls back to anchor download if File System Access API is unavailable. */
+   *  Falls back to anchor download if File System Access API is unavailable or in a sandboxed iframe. */
   const triggerSafeDownload = async (blob: Blob, filename: string): Promise<void> => {
-    // Primary: File System Access API — native OS Save dialog, 100% correct filename.
-    // Works on localhost (treated as secure context in Chrome/Edge).
-    if ("showSaveFilePicker" in window) {
+    // Primary: File System Access API — skip if running inside a sandboxed/cross-origin iframe where it throws SecurityError
+    if (!isSandboxedIframe() && "showSaveFilePicker" in window) {
       try {
         const ext = filename.split(".").pop()?.toLowerCase() ?? "bin";
         const mimeType = blob.type.split(";")[0].trim() || "application/octet-stream";
@@ -124,11 +123,11 @@ export const App: React.FC = () => {
         return; // done — OS saved with the exact filename
       } catch (err: any) {
         if (err.name === "AbortError") return; // user cancelled — do not fall back
-        console.warn("[Download] showSaveFilePicker failed, falling back to anchor:", err.message);
+        console.warn("[Download] showSaveFilePicker failed, falling back to anchor:", err?.message || err);
       }
     }
 
-    // Fallback: blob: URL + FileSaver.js timing pattern
+    // Fallback: immediate anchor click with next-tick revocation
     downloadWithAnchor(blob, filename);
   };
 
@@ -178,46 +177,68 @@ export const App: React.FC = () => {
   };
 
   // Flow 3: Export individual files and bundle
-  const getImageFilename = () => {
+  const getImageFilename = (): string => {
     if (!imageBlob) return "truecapture-final.png";
-    return imageBlob.type === "image/jpeg" ? "truecapture-final.jpg" : "truecapture-final.png";
+    const mime = imageBlob.type ? imageBlob.type.split(";")[0].trim().toLowerCase() : "";
+    const ext = (mime && MIME_TO_EXT[mime]) || "png";
+    return `truecapture-final.${ext}`;
   };
 
-  const handleExportImage = () => {
+  const handleExportImage = async () => {
     if (!imageBlob) return;
-    triggerSafeDownload(imageBlob, getImageFilename());
+    try {
+      await triggerSafeDownload(imageBlob, getImageFilename());
+    } catch (err) {
+      console.error("Failed to export image:", err);
+      alert("Failed to download image. Please try again.");
+    }
   };
 
-  const handleExportManifest = () => {
+  const handleExportManifest = async () => {
     if (manifest.chain.length === 0) return;
-    const manifestJsonString = JSON.stringify(manifest, null, 2);
-    const manifestBlob = new Blob([manifestJsonString], {
-      type: "application/json;charset=utf-8",
-    });
-    triggerSafeDownload(manifestBlob, "manifest.json");
+    try {
+      const manifestJsonString = JSON.stringify(manifest, null, 2);
+      const manifestBlob = new Blob([manifestJsonString], {
+        type: "application/json;charset=utf-8",
+      });
+      await triggerSafeDownload(manifestBlob, "manifest.json");
+    } catch (err) {
+      console.error("Failed to export manifest:", err);
+      alert("Failed to download manifest. Please try again.");
+    }
   };
 
   const handleCopyManifest = async () => {
     if (manifest.chain.length === 0) return;
-    const manifestJsonString = JSON.stringify(manifest, null, 2);
-    await navigator.clipboard.writeText(manifestJsonString);
-    setCopiedJson(true);
-    setTimeout(() => setCopiedJson(false), 2000);
+    try {
+      const manifestJsonString = JSON.stringify(manifest, null, 2);
+      await navigator.clipboard.writeText(manifestJsonString);
+      setCopiedJson(true);
+      setTimeout(() => setCopiedJson(false), 2000);
+    } catch (err) {
+      console.error("Failed to copy manifest:", err);
+      alert("Failed to copy manifest to clipboard.");
+    }
   };
 
-  const handleExportAll = () => {
+  const handleExportAll = async () => {
     if (!imageBlob || manifest.chain.length === 0) return;
 
-    // Bundle download: use anchor pattern directly (avoids double OS Save dialogs)
-    // Image first, manifest after 800 ms so browsers don't block simultaneous downloads
-    downloadWithAnchor(imageBlob, getImageFilename());
+    try {
+      // Bundle download: use anchor pattern directly (avoids double OS Save dialogs)
+      // Image first, manifest after 800 ms so browsers don't block simultaneous downloads
+      downloadWithAnchor(imageBlob, getImageFilename());
 
-    setTimeout(() => {
+      await new Promise((resolve) => setTimeout(resolve, 800));
+
       const manifestBlob = new Blob([JSON.stringify(manifest, null, 2)], {
-        type: "application/json",
+        type: "application/json;charset=utf-8",
       });
       downloadWithAnchor(manifestBlob, "manifest.json");
-    }, 800);
+    } catch (err) {
+      console.error("Failed to export bundle:", err);
+      alert("Failed to download files. Please try again.");
+    }
   };
 
   // Quick link to send studio data directly to verifier
@@ -467,7 +488,13 @@ export const App: React.FC = () => {
                       title="Download image file only"
                     >
                       <ImageIcon className="w-3.5 h-3.5 text-emerald-400" />
-                      <span>Image ({imageBlob.type === "image/jpeg" ? ".jpg" : ".png"})</span>
+                      <span>
+                        Image (.
+                        {imageBlob.type
+                          ? MIME_TO_EXT[imageBlob.type.split(";")[0].trim().toLowerCase()] || "png"
+                          : "png"}
+                        )
+                      </span>
                     </button>
 
                     <button
